@@ -1,7 +1,5 @@
 import os
-import sys
 import numpy as np
-from Lib.Tree import SQLiteTree, SQLiteStack, RegularStack, RegularTree
 from pathlib import Path
 from datetime import datetime
 import pickle
@@ -10,6 +8,7 @@ import threading
 import re
 import logging
 from timeit import default_timer as timer
+from crpalign import align
 
 '''
 Please note that the code below uses:
@@ -17,10 +16,7 @@ Please note that the code below uses:
     <q> to denote the question that points to alignment gaps
 '''
 
-USE_THREADS = False
-PROCESS_LANGS_CONCURRENT = False
 PRINT_LOG = False
-lock = threading.Lock()
 
 # Reused. Original source: https://stackoverflow.com/a/2669120/1984350
 def sorted_nicely(l):
@@ -83,130 +79,50 @@ def get_words_and_morphemes(fname):
                 morphs = ['<d>' if x == '/' else x for x in morphs]
                 morphemes = np.array(morphs)
                 word_and_morphemes.append((word, morphemes))
-    except Exception as err:
+    except Exception as err7:
         print('get_words_and_morphemes() failed for file', fname)
     return word_and_morphemes
 
 
-def get_score(top, bottom):
-    score = 0
-    for i in range(max(len(top), len(bottom))):
-        if i < len(top) and i < len(bottom):
-            if top[i] == bottom[i]:
-                score += 1
-    return score
-
-
-def complete_tree(curr_tree_stack, tree):
-    while not curr_tree_stack.is_empty():
-        head_of_stack = curr_tree_stack.pop()
-        top = head_of_stack[0]
-        bottom = head_of_stack[1]
-        parent_id = head_of_stack[2]
-
-        if len(top) != 0 and len(bottom) != 0:
-            wi = top[0]
-            mi = bottom[0]
-            if wi == mi:
-                top = top[1:]
-                bottom = bottom[1:]
-                node_id = tree.get_node_id()
-
-                node_t = tree.get_top_of_node(parent_id) + [wi]
-                node_b = tree.get_bottom_of_node(parent_id) + [mi]
-                node_depth = tree.get_depth_of_node(parent_id) + 1
-                tree.add_node(node_t, node_b, node_depth, parent_id, node_id)
-
-                curr_tree_stack.push([top, bottom, node_id])
-            elif wi != mi:
-                t0 = tree.get_top_of_node(parent_id) + [wi]
-                b0 = tree.get_bottom_of_node(parent_id) + ['<q>']
-                t1 = tree.get_top_of_node(parent_id) + ['<q>']
-                b1 = tree.get_bottom_of_node(parent_id) + [mi]
-
-                score0 = get_score(t0, b0)
-                score1 = get_score(t1, b1)
-
-                tc_zero = top[1:]
-                bc_zero = bottom
-                tc_one = top
-                bc_one = bottom[1:]
-
-                node_depth = tree.get_depth_of_node(parent_id) + 1
-
-                if score0 > score1:
-                    node_zero_id = tree.get_node_id()
-                    tree.add_node(t0, b0, node_depth, parent_id, node_zero_id)
-                    curr_tree_stack.push([tc_zero, bc_zero, node_zero_id])
-                elif score0 < score1:
-                    node_one_id = tree.get_node_id()
-                    tree.add_node(t1, b1, node_depth, parent_id, node_one_id)
-                    curr_tree_stack.push([tc_one, bc_one, node_one_id])
-                else:
-                    node_zero_id = tree.get_node_id()
-                    node_one_id = tree.get_node_id()
-
-                    tree.add_node(t0, b0, node_depth, parent_id, node_zero_id)
-                    tree.add_node(t1, b1, node_depth, parent_id, node_one_id)
-
-                    curr_tree_stack.push([tc_zero, bc_zero, node_zero_id])
-                    curr_tree_stack.push([tc_one, bc_one, node_one_id])
-
-
-def get_max_nodes(all_nodes):
-    max_nodes_container = []
-    for node in all_nodes:
-        node_t = node.get_top()
-        node_b = node.get_bottom()
-        node_score = get_score(node_t, node_b)
-
-        if len(max_nodes_container) > 0:
-            max_node_t = max_nodes_container[0].get_top()
-            max_node_b = max_nodes_container[0].get_bottom()
-            max_score = get_score(max_node_t, max_node_b)
-            if max_score < node_score:
-                max_nodes_container.clear()
-                max_nodes_container.append(node)
-            elif max_score == node_score:
-                max_nodes_container.append(node)
+def get_candidate_alignments(w, m):    
+    new_m = []
+    for _, val in enumerate(m):
+        if val == '<d>':
+            new_m.append('')
         else:
-            max_nodes_container.append(node)
-    return max_nodes_container
-
-
-def get_candidate_alignments(w, m):
-    path_tree = RegularTree()
-    root = path_tree.get_root()
-
-    logging.info('\t\t\t\t\tConstructing alignment tree')
-    curr_tree_stack = RegularStack()
-    curr_tree_stack.push([w.tolist(), m.tolist(), root.id])
-    start_ct_time = timer()
-    complete_tree(curr_tree_stack, path_tree)
-    end_ct_time = timer()
-    logging.info('\t\t\t\t\tDone!')
-    logging.debug(
-        'Tree construction took {0} for max w/m length {1}'.format(prettify_time(int(end_ct_time - start_ct_time)),
-                                                                   max(w.shape[0], m.shape[0])))
-    logging.info('\t\t\t\t\tRetrieving max nodes')
-
-    all_end_nodes = path_tree.get_leafs()
-    max_nodes = get_max_nodes(all_end_nodes)
-    logging.info('\t\t\t\t\tDone!')
-    logging.info('\t\t\t\tRetrieving alignments'.format())
+            new_m.append(val)
+            
+    lines = [[''.join(w), ''.join(new_m)]]
+    _alignments = align.Aligner(lines, '<q>', iterations = 80, mode = 'crp')
 
     alignments = []
-    for node in max_nodes:
-        t = node.get_top()
-        b = node.get_bottom()
-
+    for iput, oput in _alignments.alignedpairs:       
+        t = []
+        b = []
+        for _, val in enumerate(m):
+            if len(iput) > 0 and len(oput) > 0:
+                if val == '<d>':
+                    t.append('<q>')
+                    b.append(val)
+                else:
+                    if (not '<q>' in [iput[0], oput[0]]) and iput[0] == oput[0]:
+                        t.append(iput[0])
+                        b.append(oput[0])
+                    elif ('<q>' in [iput[0], oput[0]]):
+                        t.append(iput[0])
+                        b.append(oput[0])
+                    else:
+                        t.append(iput[0])
+                        b.append('<q>')
+                        
+                        t.append('<q>')
+                        b.append(oput[0])
+                        
+                iput = iput[1:]
+                oput = oput[1:]
+                  
         alignment = np.array((t, b))
         alignments.append(alignment)
-
-    curr_tree_stack.dispose()
-    path_tree.dispose()
-
-    logging.info('\t\t\t\tFound {} alignments'.format(len(alignments)))
     return alignments
 
 
@@ -224,7 +140,7 @@ def get_morpheme_spans(alignment):
             spans.append(np.array([current_t_span, current_b_span]))
             current_t_span = []
             current_b_span = []
-    spans.append(np.array([current_t_span, current_b_span]))
+    spans.append(np.array([current_t_span, current_b_span]))        
     return spans
 
 
@@ -301,7 +217,6 @@ def extract_phon_cond_from_word_morphemes(w, m, outpfname):
         p.parent.mkdir(exist_ok=True, parents=True)
     f = p.open('ab')
 
-    lock.acquire()
     for rule in rules:
         f.write(pickle.dumps(w))
         f.write(b'[{SEP}]\n')
@@ -313,7 +228,7 @@ def extract_phon_cond_from_word_morphemes(w, m, outpfname):
         logging.info('\t\t\t\t\t{0}/{1}. Rule = {2}'.format(idx_rule + 1, len(rules), rule))
         idx_rule += 1
     f.close()
-    lock.release()
+
     logging.info('\t\t\tDone!')
     extract_proc_end_time = timer()
     logging.debug(
@@ -326,26 +241,15 @@ def extract_phon_cond_from_file(filename_count, fnames, fname, raw_path, rules_p
     logging.info('\tProcessing file {0}/{1} - {2}\n'.format(filename_count, len(fnames), fname))
     outpfname = fname.replace(raw_path, rules_path)
 
-    threads = []
-
     items = get_words_and_morphemes(fname)
     item_count = 0
     for item in items:
         item_count += 1
 
         w, m = item
-        if w.shape[0] <= 10:
-            logging.info('\t\t\t{0}. Processing w = {1} and m = {2}'.format(item_count, w, m))
-            if USE_THREADS:
-                t = threading.Thread(target=extract_phon_cond_from_word_morphemes, args=(w, m, outpfname,))
-                t.start()
-                threads.append(t)
-            else:
-                extract_phon_cond_from_word_morphemes(w, m, outpfname)
-
-    if USE_THREADS:
-        for t in threads:
-            t.join()
+        
+        logging.info('\t\t\t{0}. Processing w = {1} and m = {2}'.format(item_count, w, m))
+        extract_phon_cond_from_word_morphemes(w, m, outpfname)
 
     logging.info('Done processing file {0}'.format(fname))
 
@@ -370,12 +274,7 @@ if __name__ == "__main__":
     # setting config details
     config = configparser.ConfigParser()
     config.read('config.ini')
-    USE_THREADS = config.getboolean('DEFAULT', 'THREADING')
     PRINT_LOG = config.getboolean('DEFAULT', 'PRINT_LOG')
-    PROCESS_LANGS_CONCURRENT = config.getboolean('DEFAULT', 'PROCESS_LANGS_CONCURRENT')
-
-    if USE_THREADS and PROCESS_LANGS_CONCURRENT:
-        threads = []
 
     logging.basicConfig(filename='output.txt', level=logging.DEBUG)
     if not PRINT_LOG:
@@ -392,15 +291,7 @@ if __name__ == "__main__":
 
     lang_count = 1
     for language in langs:
-        if USE_THREADS and PROCESS_LANGS_CONCURRENT:
-            t = threading.Thread(target=process_lang, args=(lang_count, langs, language,))
-            t.start()
-            threads.append(t)
-        else:
-            process_lang(lang_count, langs, language)
+        process_lang(lang_count, langs, language)
         lang_count += 1
 
-    if USE_THREADS and PROCESS_LANGS_CONCURRENT:
-        for t in threads:
-            t.join()
     logging.info('Ended at {0}'.format(datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
